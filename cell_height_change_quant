@@ -1,0 +1,407 @@
+#run this code everytime for measuring
+# Load and process image(single image)-resave the file through Fiji for time displacement for protein's location change
+import numpy as np
+import cv2
+import matplotlib.pyplot as plt
+from skimage import io, filters, measure, morphology
+from skimage.morphology import skeletonize, thin
+from skimage.color import rgb2gray
+from scipy.spatial import cKDTree
+from scipy.ndimage import gaussian_filter1d
+import os
+import tifffile as tiff
+import pandas as pd
+from scipy.ndimage import label
+from tifffile import TiffFile
+
+
+def load_image(image_path):
+    with TiffFile(image_path) as tif:
+        # Check if the file contains multiple frames
+        if len(tif.pages) > 1:
+            img = tif.pages[0].asarray()  # Use the first frame
+        else:
+            img = tif.asarray()
+
+    # Convert to grayscale if RGB
+    if len(img.shape) == 3 and img.shape[-1] == 3:
+        img = rgb2gray(img)
+    elif len(img.shape) == 3:  # Handle multi-channel non-RGB images
+        img = np.mean(img, axis=0)
+
+    return img
+
+def compute_control_threshold(control_folder):
+    control_images = [load_image(os.path.join(control_folder, f)) for f in os.listdir(control_folder) if f.endswith(".tif")]
+    control_means = [np.mean(filters.gaussian(img, sigma=2)) for img in control_images]
+    control_stds = [np.std(filters.gaussian(img, sigma=2)) for img in control_images]
+    global_threshold = np.mean(control_means) + np.mean(control_stds) *0
+    return global_threshold
+
+def preprocess_image(img, global_threshold, sigma=1, size_threshold=20):
+    blurred = filters.gaussian(img, sigma=sigma)
+    binary = blurred > global_threshold
+    
+    # Remove small particles
+    labeled = measure.label(binary)
+    regions = measure.regionprops(labeled)
+    filtered = np.zeros_like(binary)
+    
+    for region in regions:
+        if region.area > size_threshold:
+            for coord in region.coords:
+                filtered[coord[0], coord[1]] = 1
+    
+    return filtered
+def generate_grid(img_shape, nx=20, ny=20):
+    x_seq = np.linspace(0, img_shape[1] - 1, nx)
+    y_seq = np.linspace(0, img_shape[0] - 1, ny)
+    
+    vertical_lines = [(int(x), 0, int(x), img_shape[0] - 1) for x in x_seq]
+    horizontal_lines = [(0, int(y), img_shape[1] - 1, int(y)) for y in y_seq]
+    
+    return vertical_lines + horizontal_lines
+
+def generate_finer_grid(img_shape, interval=1):
+    """
+    Generate a finer grid of vertical and horizontal lines based on the image shape.
+
+    Parameters:
+        img_shape (tuple): Shape of the image (height, width).
+        interval (int): Spacing between grid lines.
+
+    Returns:
+        list: List of grid lines represented as (x1, y1, x2, y2).
+    """
+    height, width = img_shape
+    vertical_lines = [(x, 0, x, height - 1) for x in range(0, width, interval)]
+    horizontal_lines = [(0, y, width - 1, y) for y in range(0, height, interval)]
+    return vertical_lines + horizontal_lines
+
+def count_intersections(binary_img, grid_lines):
+    points = np.column_stack(np.where(binary_img > 0))
+    tree = cKDTree(points)
+    
+    intersection_points = []
+    for x1, y1, x2, y2 in grid_lines:
+        line_x = np.linspace(x1, x2, num=1024, dtype=int)
+        line_y = np.linspace(y1, y2, num=1024, dtype=int)
+        line_points = np.column_stack((line_y, line_x))
+        
+        distances, indices = tree.query(line_points, distance_upper_bound=1)
+        intersection_indices = indices[distances < 1]
+        intersection_points.extend(points[intersection_indices])
+    
+    return len(intersection_points), np.array(intersection_points)
+
+
+# assumes you already have: compute_control_threshold, thin, preprocess_image, count_intersections, generate_finer_grid
+
+# --- Config ---
+control_folder = "/Users/apple/Desktop/Ian_lab/python_script/cell_height_v2/control_png"
+global_threshold = compute_control_threshold(control_folder)
+
+image_path = "/Users/apple/Desktop/Ian_lab/python_script/cell_height_v2/250813-EpH4 Zo1mSG NT or KOPals1+Veh_CNO3_H2O Overnight 001 - Denoised-Slices-Slices_crop_crop.png"
+save_folder = "/Users/apple/Desktop/Ian_lab/python_script/cell_height_v2/results/250813-EpH4 Zo1mSG NT or KOPals1+Veh_CNO3_H2O Overnight 001 - Denoised-Slices-Slices_crop_crop"
+
+# Ensure save_folder is correctly created
+os.makedirs(save_folder, exist_ok=True)
+
+# --- Accumulators (one entry per slice, always) ---
+all_ymins = []
+all_ymaxs = []
+all_avg_displacements = []
+all_t_first_zero = []   # starting time (highest y left of min)
+all_t_first_point = []  # earliest local minimum time (d2>0)
+all_time_diffs = []
+
+# Pretty print helper
+def _fmt(v):
+    return "NaN" if v is None or (isinstance(v, float) and not np.isfinite(v)) else f"{float(v):.3f}"
+
+# --- Load slices ---
+with TiffFile(image_path) as tif:
+    num_slices = len(tif.pages)  # Determine the total number of slices
+    all_slices = [page.asarray() for page in tif.pages[:num_slices]]  # Process all available slices
+
+# --- Process each slice ---
+for i, img in enumerate(all_slices):
+    print(f"\nProcessing slice {i+1}/{len(all_slices)} | shape={img.shape}")
+
+    # Ensure 2D
+    if img.ndim == 3 and img.shape[-1] == 1:
+        img = img[:, :, 0]
+    if img.ndim != 2:
+        print(f"⚠️ Skipping slice {i} due to unexpected shape: {img.shape}")
+        # keep lists aligned
+        all_avg_displacements.append(np.nan)
+        all_t_first_point.append(np.nan)
+        all_t_first_zero.append(np.nan)
+        all_time_diffs.append(np.nan)
+        all_ymins.append(np.nan)
+        all_ymaxs.append(np.nan)
+        continue
+
+    # Preprocess & grid
+    binary_img = thin(preprocess_image(img, global_threshold))
+    grid_lines = generate_finer_grid(img.shape, interval=1)
+
+    # Intersections
+    num_intersections, intersection_points = count_intersections(binary_img, grid_lines)
+    print(f"Intersections: {num_intersections}")
+    intersection_points = np.atleast_2d(intersection_points)
+
+    # Collect displacements along vertical grid lines
+    displacements = []
+    grid_x_positions = []
+    pixel_size_um = 0.16
+    tolerance = 1
+    min_valid_y = 20
+
+    # Basal from last vertical grid line
+    vertical_lines = [line for line in grid_lines if line[0] == line[2]]
+    if vertical_lines:
+        last_vertical_line = max(vertical_lines, key=lambda l: l[0])
+        last_x = last_vertical_line[0]
+        basal_y = None
+        for y in range(img.shape[0] - 1, -1, -1):
+            if img[y, last_x] > 10:
+                basal_y = y
+                break
+        if basal_y is None:
+            basal_y = img.shape[0] - 1
+    else:
+        basal_y = img.shape[0] - 1
+    fixed_basal_y = basal_y
+
+    for x1, y1, x2, y2 in grid_lines:
+        if intersection_points.shape[1] < 2:
+            continue
+        points_on_line = intersection_points[np.abs(intersection_points[:, 1] - x1) <= tolerance]
+        points_on_line = np.atleast_2d(points_on_line)
+        if points_on_line.size == 0:
+            continue
+
+        valid_points = points_on_line[
+            (points_on_line[:, 0] >= min_valid_y) &
+            (points_on_line[:, 0] <= fixed_basal_y)
+        ]
+        if len(valid_points) > 0:
+            ys = valid_points[:, 0]
+            apical_y = np.percentile(ys, 10)
+            displacement_px = fixed_basal_y - apical_y
+            displacements.append(displacement_px * pixel_size_um)
+            grid_x_positions.append(x1)
+
+    # Sort and smooth (handle empty gracefully)
+    if len(grid_x_positions) == 0:
+        sorted_x = np.array([])
+        sorted_displacements = np.array([])
+        smoothed_displacements = np.array([])
+    else:
+        order = np.argsort(grid_x_positions)
+        sorted_x = np.array(grid_x_positions)[order]
+        sorted_displacements = np.array(displacements)[order]
+        smoothed_displacements = gaussian_filter1d(sorted_displacements, sigma=5)
+
+    # X→Time (hr) mapping (0–20 hr across width)
+    total_hours = 20.0
+    W = img.shape[1]
+    px_to_hr = total_hours / max(W - 1, 1)
+    time_hr = sorted_x * px_to_hr
+    disp_um = sorted_displacements
+    disp_um_smooth = smoothed_displacements
+
+    # Average displacement (always append something)
+    avg_disp_this_slice = float(np.mean(disp_um)) if disp_um.size else np.nan
+    all_avg_displacements.append(avg_disp_this_slice)
+
+    # -------- Robust earliest local MIN detection (with interpolated curvature) --------
+    t_first_point = np.nan   # earliest local minimum time (d2>0)
+    t_zero_point  = np.nan   # highest y strictly left of t_first_point
+    time_diff     = np.nan
+
+    if time_hr.size >= 3 and disp_um_smooth.size >= 3:
+        # Use unique time points to avoid gradient issues
+        t_unique, keep_idx = np.unique(time_hr, return_index=True)
+        y_unique = disp_um_smooth[keep_idx] if disp_um_smooth.size else np.array([])
+
+        if t_unique.size >= 3 and y_unique.size == t_unique.size:
+            d1 = np.gradient(y_unique, t_unique)   # first derivative
+            d2 = np.gradient(d1, t_unique)         # second derivative
+
+            # zero-crossings of first derivative
+            sign = np.sign(d1)
+            crossings = np.where(sign[:-1] * sign[1:] <= 0)[0]
+
+            def zero_time_between(k):
+                t0, t1 = t_unique[k], t_unique[k+1]
+                a0, a1 = d1[k], d1[k+1]
+                return t0 - a0 * (t1 - t0) / (a1 - a0) if a1 != a0 else t0
+
+            def interp_between(arr, k, t_cross):
+                """Linear interpolation of arr between k and k+1 evaluated at t_cross."""
+                t0, t1 = t_unique[k], t_unique[k+1]
+                if t1 == t0:
+                    return arr[k]
+                alpha = (t_cross - t0) / (t1 - t0)
+                return arr[k] + alpha * (arr[k+1] - arr[k])
+
+            # Debugging output for slice 1
+            if i == 0:  # Assuming slice 1 is index 0
+                print("Debugging slice 1:")
+                print(f"t_unique: {t_unique}")
+                print(f"y_unique: {y_unique}")
+
+            # Filter crossings where the first derivative is zero, second derivative is positive, and y-coordinate difference is at least 1 µm
+            valid_crossings = []
+            for k in crossings:
+                t_cross = zero_time_between(k)
+                d2_cross = interp_between(d2, k, t_cross)
+                y_cross = interp_between(y_unique, k, t_cross)
+
+                # Ensure the first derivative is zero and second derivative is positive
+                if d2_cross > 0:
+                    # Check y-coordinate difference with the last valid crossing
+                    if len(valid_crossings) == 0 or abs(y_cross - valid_crossings[-1][2]) >= 1.0:
+                        valid_crossings.append((k, t_cross, y_cross))
+
+            # Find the earliest valid crossing
+            found_min = False
+            for k, t_cross, y_cross in valid_crossings:
+                print(f"Valid crossing found at t={t_cross:.3f}, y={y_cross:.3f}")
+                t_first_point = t_cross
+                found_min = True
+                break
+
+            if not found_min:
+                print("No valid crossing found.")
+                # Fallback to original logic if no valid crossing is found
+                for k in crossings:
+                    t_cross = zero_time_between(k)
+                    d2_cross = interp_between(d2, k, t_cross)
+                    if d2_cross > 0:
+                        t_first_point = t_cross
+                        found_min = True
+                        break
+
+            if found_min:
+                # t_zero_point = highest y strictly to the left of t_first_point
+                left_mask = t_unique < t_first_point
+                if np.any(left_mask):
+                    idx_left = np.argmax(y_unique[left_mask])
+                    t_zero_point = t_unique[left_mask][idx_left]
+                    if np.isfinite(t_zero_point):
+                        time_diff = abs(t_first_point - t_zero_point)
+                # else: remains NaN (no left-side samples)
+            # else: no true local minimum detected -> keep NaNs
+    # -------------------------------------------------------------------
+
+    # Append one value per slice for all lists
+    all_t_first_point.append(t_first_point)  # earliest local min time
+    all_t_first_zero.append(t_zero_point)    # starting time (max y left of min)
+    all_time_diffs.append(time_diff)
+
+    # Track y-range (nan-safe)
+    all_ymins.append(np.min(smoothed_displacements) if smoothed_displacements.size else np.nan)
+    all_ymaxs.append(np.max(smoothed_displacements) if smoothed_displacements.size else np.nan)
+
+    # Per-slice printout
+    print(f"Slice {i}: t_first_point(min)={_fmt(t_first_point)} hr, "
+          f"t_zero_point(start)={_fmt(t_zero_point)} hr, "
+          f"|Δt|={_fmt(time_diff)} hr, "
+          f"avg_disp={_fmt(avg_disp_this_slice)} µm")
+
+    # Save per-slice table
+    df_slice = pd.DataFrame({
+        "Time (hr)": time_hr,
+        "Protein Displacement Raw (µm)": disp_um,
+        "Protein Displacement Smoothed (µm)": disp_um_smooth
+    })
+    slice_tag = f"slice_{i}"
+    excel_path = os.path.join(save_folder, f"{slice_tag}_prt_displacement.xlsx")
+    df_slice.to_excel(excel_path, index=False)
+    print(f"✅ Excel file saved: {excel_path}")
+
+# --- Unified y-axis plots with vertical red dotted lines + red dots ---
+print("\nRe-plotting graphs with unified y-axis scale...")
+try:
+    global_ymin = np.nanmin(np.array(all_ymins, dtype=float))
+    global_ymax = np.nanmax(np.array(all_ymaxs, dtype=float))
+    if not np.isfinite(global_ymin) or not np.isfinite(global_ymax):
+        raise ValueError
+except Exception:
+    global_ymin, global_ymax = 0.0, 1.0
+
+for i, _ in enumerate(all_slices):
+    slice_tag = f"slice_{i}"
+    excel_path = os.path.join(save_folder, f"{slice_tag}_prt_displacement.xlsx")
+    if not os.path.exists(excel_path):
+        print(f"❌ Missing data for {slice_tag}, skipping...")
+        continue
+
+    df = pd.read_excel(excel_path)
+    tx = df["Time (hr)"].to_numpy()
+    y_raw = df["Protein Displacement Raw (µm)"].to_numpy()
+    y_smooth = df["Protein Displacement Smoothed (µm)"].to_numpy()
+    avg_displacement = float(np.mean(y_raw)) if y_raw.size else np.nan
+
+    plt.figure(figsize=(12, 6))
+    plt.plot(tx, y_raw, color='lightgray', alpha=0.5, label="Raw Displacement")
+    plt.plot(tx, y_smooth, linewidth=2, label="Smoothed Protein Displacement")
+
+    # Red dotted vertical lines + red dot markers at y_smooth(t)
+    t_start = all_t_first_zero[i]   # starting time (max y left of min)
+    t_min   = all_t_first_point[i]  # earliest local min time
+
+    def _maybe_mark(tmark, label):
+        if np.isfinite(tmark) and tx.size and y_smooth.size:
+            if tmark >= np.nanmin(tx) and tmark <= np.nanmax(tx):
+                # vertical dotted red line
+                plt.plot([tmark, tmark], [global_ymin - 0.5, global_ymax + 0.5],
+                         linestyle=':', color='red', linewidth=1.5, alpha=0.9)
+                # red dot at interpolated y on smoothed curve
+                ymark = np.interp(tmark, tx, y_smooth)
+                plt.scatter([tmark], [ymark], color='red', s=36, zorder=5, label=label)
+
+    _maybe_mark(t_start, "t_zero_point (start)")
+    _maybe_mark(t_min, "t_first_point (min)")
+
+    # Avg line
+    if np.isfinite(avg_displacement):
+        plt.axhline(avg_displacement, color='red', linestyle='--', linewidth=2,
+                    label=f'Avg Displacement: {avg_displacement:.2f} µm')
+
+    plt.ylabel("Protein Displacement (µm)", fontsize=12)
+    plt.xlabel("Time (hr)", fontsize=12)
+    plt.title("Protein Displacement Change Over Time", fontsize=14)
+    plt.legend(loc='lower left', bbox_to_anchor=(0.01, 0.01),
+               frameon=True, framealpha=0.5, fontsize=11)
+    plt.ylim(global_ymin - 0.5, global_ymax + 0.5)
+    plt.tight_layout()
+    plt.grid(axis='y', linestyle='--', alpha=0.7)
+
+    graph_path = os.path.join(save_folder, f"{slice_tag}_prt_displacement.png")
+    plt.savefig(graph_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"📈 Unified y-scale graph saved: {graph_path}")
+
+# --- Summary Excel (lengths guaranteed) ---
+n = len(all_avg_displacements)
+print("\nSummary lengths:",
+      len(all_avg_displacements), len(all_t_first_point), len(all_t_first_zero), len(all_time_diffs))
+
+avg_displacement_data = {
+    "Slice Index": list(range(n)),
+    "Average Protein Displacement (µm)": all_avg_displacements,
+    "t_first_point (hr)": all_t_first_point,   # earliest local min
+    "t_first_zero (hr)": all_t_first_zero,     # starting time (max y left of min)
+    "Time to first d/dt=0 (hr)": all_time_diffs
+}
+df_avg = pd.DataFrame(avg_displacement_data)
+avg_excel_path = os.path.join(save_folder, "average_prt_displacements_summary.xlsx")
+df_avg.to_excel(avg_excel_path, index=False)
+print(f"✅ Excel file with average displacements saved: {avg_excel_path}")
+
+print("✅ All slices processed and graphs saved.")
+# End of script
